@@ -23,18 +23,18 @@ from instaloader import (
         QueryReturnedBadRequestException)
 
 # Base RateController config
-MAX_REQUESTS_PER_HOUR = 120
+MAX_REQUESTS_PER_HOUR = 100
 MIN_REQUEST_INTERVAL = 2.0
 MIN_REQUEST_JITTER = 1.0
 INITIAL_BACKOFF = 20
 BACKOFF_FACTOR = 1.5
 DAILY_LIMIT = 0
 
-POSTS_BEFORE_WAIT_MIN = 3
-POSTS_BEFORE_WAIT_MAX = 15
+POSTS_BEFORE_WAIT_MIN = 5
+POSTS_BEFORE_WAIT_MAX = 30
 
 LONG_PAUSE_WAIT_MIN = 30
-LONG_PAUSE_WAIT_MAX = 180
+LONG_PAUSE_WAIT_MAX = 3600
 
 class RateController(instaloader.RateController):
     def __init__(self, context):
@@ -665,7 +665,12 @@ class InstagramFetcher:
                 whash = image_hashes.whash
                 chash = image_hashes.chash
                 ahash = image_hashes.ahash
-
+                # you have two different ways to check for human in image (one in local yolo model, and the other is yolo api)
+                # if --use-yolo-api is set, use yolo api
+                # yolo_result = self.yolo_provider.has_human(file_path, use_api=True)
+                # human_score = float(yolo_result.confidence)
+                # human_count = yolo_result.human_count
+                # if --use-yolo-api is not set, then yuse local yolo model
                 yolo_result = self.yolo_provider.has_human(file_path)
                 has_human = yolo_result.has_human
                 human_score = float(yolo_result.confidence)
