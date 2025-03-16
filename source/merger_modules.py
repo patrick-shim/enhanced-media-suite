@@ -97,36 +97,37 @@ class Merger:
                             self.logger.debug(f"[Merger] Skipping unknown file type: {source_file_path}")
                             continue
                         
-                        # Submit a job for each file
-                        executor.submit(self._handle_file, source_file_path, destination_file_path, destination_type, stop_flag_ref)
+                        if self.human_only and file_ext in self.image_extensions and self.yolo_provider:
+                            try:
+                                yolo_result = self.yolo_provider.has_human(source_file_path)
+                                if not yolo_result.has_human:
+                                    continue
+                                was_human = True
+                            except Exception as e:
+                                self.logger.error(f"[Merger] Error checking human detection in {source_file_path}: {e}")
+                                continue
+                        else:
+                            was_human = False
+                        # get filename from the path:
 
-    def _handle_file(self, source_path: str, dest_path: str, file_type: str, stop_flag_ref: Callable[[], bool]):
+                        self.logger.info(f"[Merger] {source_file_path} -> {destination_file_path}")
+                        executor.submit(self._handle_file, source_file_path, destination_file_path, destination_type, was_human, stop_flag_ref)
+
+    def _handle_file(self, source_path: str, dest_path: str, file_type: str, was_human: bool, stop_flag_ref: Callable[[], bool]):
         """
         Handle a single file with advanced deduplication and prioritization logic.
         
         :param source_path: Full path to the source file
         :param dest_path: Proposed destination path for the file
         :param file_type: Type of file (image/video)
+        :param was_human: Flag indicating if a human was detected in the image
         :param stop_flag_ref: Function to check if operation should stop
         """
         # Immediately check stop flag
         if stop_flag_ref():
             return
 
-        was_human = False
         self.logger.debug(f"[Merger] currently processing {source_path}")
-        # Rule 0: If human_only is enabled and no human detected => skip
-        if self.human_only and file_type == "image" and self.yolo_provider:
-            try:
-                yolo_result = self.yolo_provider.has_human(source_path)
-                if not yolo_result.has_human:
-                    return
-                # Log human detection details
-                was_human = True
-
-            except Exception as e:
-                self.logger.error(f"[Merger] Error checking human detection in {source_path}: {e}")
-                return
 
         # Compute source file's blake3 hash
         try:
@@ -188,8 +189,8 @@ class Merger:
             
             # Copy the file
             shutil.copy2(source_path, dest_path)
-            
             self.logger.info(f"[Merger] Copied new ({file_type}, human: {was_human}) file: {source_path} -> {dest_path}")
+
         except Exception as e:
             self.logger.error(f"[Merger] Error copying {file_type} file {source_path} -> {dest_path}: {e}")
 
