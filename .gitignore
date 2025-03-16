@@ -1,0 +1,13 @@
+# Ignore log files
+logs/
+*.log
+
+# Ignore compiled Python files
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Ignore model files (if they are large)
+model/
+*.pt
