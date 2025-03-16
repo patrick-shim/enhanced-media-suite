@@ -5,7 +5,7 @@ import argparse
 import pyodbc
 
 from source.logging_modules import CustomLogger
-from source.db_modules import DatabaseConnection, DatabaseManager
+from source.database_modules import DatabaseConnection, DatabaseManager
 from source.deduper_modules_db import Deduper
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -13,8 +13,8 @@ def parse_args():
     )
     parser.add_argument(
         "--source-table", 
-        default="tbl_scanner", 
-        help="Source table name (default: tbl_scanner)"
+        default="tbl_fetcher", 
+        help="Source table name (default: tbl_fetcher)"
     )
     parser.add_argument(
         "--target-table",
