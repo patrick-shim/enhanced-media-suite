@@ -17,54 +17,40 @@ from source.logging_modules import CustomLogger
 from source.database_modules import DatabaseConnection, DatabaseManager
 from source.hash_modules import HashCalculator
 from source.fingerprint_modules import VideoFingerprinter
-from source.yolo_modules import YoloProvider
+from source.yolo_modules import YoloProvider, get_yolo_provider
 from source.fetcher_modules import InstagramFetcher, RateController
 
 def parse_args(default_table_name: str, default_download_directory):
     """
     Parse and return CLI arguments using subcommands for different modes.
     """
-    parser = argparse.ArgumentParser(
-        description="Download Instagram profile's posts and store metadata in SQL."
-    )
+    parser = argparse.ArgumentParser(description="Download Instagram profile's posts and store metadata in SQL.")
     
     # Common arguments for all modes
-    parser.add_argument("--table-name", type=str, default=f"{default_table_name}", 
-                       help="DB table name")
-    parser.add_argument("--skip-database", action="store_true", default=False, 
-                       help="Skip record insertion to database")
-    parser.add_argument("--reset-table", action="store_true", default=False, 
-                       help="Reset the media table in DB")
+    parser.add_argument("--table-name", type=str, default=f"{default_table_name}", help="DB table name")
+    parser.add_argument("--skip-database", action="store_true", default=False, help="Skip record insertion to database")
+    parser.add_argument("--reset-table", action="store_true", default=False, help="Reset the media table in DB")
+    
+    # Add YOLO provider arguments - simplified
+    parser.add_argument("--use-remote-yolo", action="store_true", default=True, help="Use remote YOLO API instead of local model")
     
     # Create subparsers for different modes
-    subparsers = parser.add_subparsers(dest="mode", required=True, 
-                                      help="Operation mode")
+    subparsers = parser.add_subparsers(dest="mode", required=True, help="Operation mode")
     
     # 1. Instagram download mode
-    instagram_parser = subparsers.add_parser("download", 
-                                           help="Download media from Instagram")
-    instagram_parser.add_argument("--login", required=True, 
-                                help="Instagram login username")
-    instagram_parser.add_argument("--profile", required=True, 
-                                help="Target Instagram profile to download from")
-    instagram_parser.add_argument("--relogin", action="store_true", default=False, 
-                                help="Re-login to Instagram by deleting the session file")
-    instagram_parser.add_argument("--save-to", type=str, default=None, 
-                                help="Directory to save downloaded media (default: profile name)")
-    instagram_parser.add_argument("--resume", action="store_true", default=True, 
-                                help="Resume from last post")
-    instagram_parser.add_argument("--limit", type=int, default=None, 
-                                help="Limit the number of posts to download")
+    instagram_parser = subparsers.add_parser("download", help="Download media from Instagram")
+    instagram_parser.add_argument("--login", required=True, help="Instagram login username")
+    instagram_parser.add_argument("--profile", required=True, help="Target Instagram profile to download from")
+    instagram_parser.add_argument("--relogin", action="store_true", default=False, help="Re-login to Instagram by deleting the session file")
+    instagram_parser.add_argument("--save-to", type=str, default=None, help="Directory to save downloaded media (default: profile name)")
+    instagram_parser.add_argument("--resume", action="store_true", default=True, help="Resume from last post (default: True)")
+    instagram_parser.add_argument("--limit", type=int, default=None, help="Limit the number of posts to download")
     
     # 2. Reverse scan mode
-    reverse_parser = subparsers.add_parser("scan", 
-                                         help="Scan local directory and process files")
-    reverse_parser.add_argument("path", type=str, 
-                              help="Path to the directory to scan")
-    reverse_parser.add_argument("--no-reset-table", action="store_true", default=False, 
-                              help="Do not reset the table before scanning")
-    reverse_parser.add_argument("--no-stats", action="store_true", default=False, 
-                              help="Do not display statistics before scanning")
+    reverse_parser = subparsers.add_parser("scan", help="Scan local directory and process files")
+    reverse_parser.add_argument("path", type=str, help="Path to the directory to scan")
+    reverse_parser.add_argument("--no-reset-table", action="store_true", default=False, help="Do not reset the table before scanning (default: False)")
+    reverse_parser.add_argument("--no-stats", action="store_true", default=False, help="Do not display statistics before scanning (default: False)")
     
     args = parser.parse_args()
     return args
@@ -127,9 +113,15 @@ def pick_user_agent(timezone_str: str, current_time_struct: time.struct_time = N
 
 def main():
     # Constants
-    MAX_RETRIES = 5  # For Instaloader connection attempts
+    MAX_RETRIES = 3  # For Instaloader connection attempts
     DEFAULT_TABLE_NAME = "tbl_fetcher"
     DEFAULT_DOWNLOAD_DIRECTORY = '/mnt/nas3/projects/assets/스크래퍼/인스타'
+    
+    # YOLO remote defaults
+    REMOTE_YOLO_URL = "http://172.16.8.45:8000"
+    REMOTE_YOLO_RETRIES = 3
+    REMOTE_YOLO_RETRY_DELAY = 2
+    REMOTE_YOLO_FALLBACK_ENABLED = True
 
     logger = CustomLogger(__name__).get_logger()
     args = parse_args(DEFAULT_TABLE_NAME, DEFAULT_DOWNLOAD_DIRECTORY)
@@ -137,8 +129,19 @@ def main():
     # Setup dependencies
     hash_calculator = HashCalculator()
     video_fingerprinter = VideoFingerprinter()
-    yolo_provider = YoloProvider("model/yolov8x.pt", iou=0.5, conf=0.5, device="auto")
 
+    yolo_provider = get_yolo_provider(
+        use_remote=args.use_remote_yolo,
+        remote_url=REMOTE_YOLO_URL,
+        max_retries=REMOTE_YOLO_RETRIES,
+        retry_delay=REMOTE_YOLO_RETRY_DELAY,
+        enable_fallback=REMOTE_YOLO_FALLBACK_ENABLED,
+        model_path="model/yolov8x.pt",
+        iou=0.5,
+        conf=0.5,
+        device="auto"
+)
+    
     # Database connection
     if args.skip_database:
         logger.info("[bright_black][Main]🏠[/bright_black][bold #FFA500]Skipping database operations[/bold #FFA500]")

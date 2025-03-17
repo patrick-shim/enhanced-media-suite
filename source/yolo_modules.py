@@ -3,15 +3,16 @@ import os
 import contextlib
 import time
 import warnings
+import requests
 import numpy as np
 import torch
 from decimal import Decimal
-from typing import List
+from typing import List, Optional, Tuple
 from PIL import Image
 from dataclasses import dataclass
 from io import StringIO
 from ultralytics import YOLO
-
+from decimal import Decimal
 from source.logging_modules import CustomLogger
 
 # Disable all warnings from ultralytics and torch
@@ -24,6 +25,41 @@ class YoloResult:
     has_human: bool
     confidence: Decimal
     human_count: int
+
+def get_yolo_provider(use_remote=False, remote_url=None, max_retries=3, retry_delay=2, enable_fallback=True, **local_params):
+    logger = CustomLogger(__name__).get_logger()
+    
+    # Default parameters for local provider
+    default_params = {
+        "model_path": "model/yolov8x.pt",
+        "iou": 0.5,
+        "conf": 0.5,
+        "device": "auto"
+    }
+    
+    # Override with any provided parameters
+    default_params.update(local_params)
+    
+    if use_remote:
+        if not remote_url:
+            raise ValueError("Remote URL is required when use_remote=True")
+            
+        # If fallback enabled, pass YoloProvider class and params
+        fallback_provider = YoloProvider if enable_fallback else None
+        fallback_params = default_params if enable_fallback else None
+        
+        logger.info(f"[bright_black][Yolo]📸[/bright_black][bold green] Initializing REMOTE YOLO provider with URL: {remote_url}[/bold green]")
+        return RemoteYoloProvider(
+            server_url=remote_url, 
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            fallback_provider=fallback_provider,
+            fallback_params=fallback_params
+        )
+    else:
+        # Just use local provider directly
+        logger.info(f"[bright_black][Yolo]📸[/bright_black][bold yellow] Initializing LOCAL YOLO provider with model: {default_params['model_path']}[/bold yellow]")
+        return YoloProvider(**default_params)
 
 class YoloProvider:
     def __init__(self, 
@@ -190,6 +226,150 @@ class YoloProvider:
                 f"Error processing image from {filepath}:[/bold red] {e}"
             )
             return YoloResult(False, Decimal('0.0'), 0)
+
+class RemoteYoloProvider:
+    """
+    YoloProvider implementation that uses a remote API server.
+    Implements the same interface as the local YoloProvider with fallback capability.
+    """
+    def __init__(self, 
+                 server_url: str,
+                 timeout: int = 10,
+                 max_retries: int = 3,
+                 retry_delay: int = 2,
+                 fallback_provider=None,
+                 fallback_params=None):
+        """
+        Initialize with the remote server URL.
+        
+        Args:
+            server_url: URL of the YOLO API server
+            timeout: HTTP request timeout in seconds
+            max_retries: Maximum number of retries before falling back
+            retry_delay: Seconds to wait between retries
+            fallback_provider: Local YoloProvider class for fallback
+            fallback_params: Parameters to initialize local provider if fallback needed
+        """
+        self.server_url = server_url.rstrip('/')
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.fallback_provider = fallback_provider
+        self.fallback_params = fallback_params or {}
+        self.logger = CustomLogger(__name__).get_logger()
+        self._local_provider = None
+        
+        # Test connection to server
+        self.server_available = self._check_server_health()
+        
+        if not self.server_available and self.fallback_provider:
+            self.logger.warning("Remote YOLO server unavailable. Will use local fallback.")
+            self._initialize_fallback()
+
+    def _check_server_health(self) -> bool:
+        """Check if the remote server is available and healthy."""
+        for attempt in range(self.max_retries):
+            try:
+                self.logger.info(f"Checking remote YOLO server health (attempt {attempt+1}/{self.max_retries})...")
+                response = requests.get(
+                    f"{self.server_url}/health", 
+                    timeout=self.timeout
+                )
+                
+                if response.status_code == 200:
+                    self.logger.info(f"Remote YOLO server available at {self.server_url}")
+                    return True
+                else:
+                    self.logger.warning(
+                        f"Remote YOLO server health check failed with status code: {response.status_code}"
+                    )
+            except requests.RequestException as e:
+                self.logger.warning(f"Failed to connect to remote YOLO server: {e}")
+            
+            # Wait before retrying
+            if attempt < self.max_retries - 1:
+                time.sleep(self.retry_delay)
+        
+        return False
+
+    def _initialize_fallback(self):
+        """Initialize the local fallback provider if needed."""
+        if self._local_provider is None and self.fallback_provider:
+            try:
+                self.logger.info("Initializing local YOLO fallback provider...")
+                self._local_provider = self.fallback_provider(**self.fallback_params)
+                self.logger.info("Local YOLO fallback provider initialized successfully")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize local fallback provider: {e}")
+
+    def has_human(self, filepath: str) -> YoloResult:
+        """
+        Detect if an image contains humans using the remote API.
+        Falls back to local provider if remote call fails.
+        """
+        # If we already know the server is not available, use fallback immediately
+        if not self.server_available:
+            self.logger.info(f"[bright_black][Yolo-REMOTE]📸[/bright_black] Server known to be unavailable, using fallback for: {filepath}")
+            return self._fallback_has_human(filepath)
+                
+        self.logger.debug(f"[bright_black][Yolo-REMOTE]📸[/bright_black] Processing image with REMOTE YOLO: {filepath}")
+        
+        # Try remote API with retries
+        for attempt in range(self.max_retries):
+            try:
+                # Send the request to the remote API
+                with open(filepath, 'rb') as file_data:
+                    files = {'file': file_data}
+                    self.logger.debug(f"Sending image to remote YOLO API (attempt {attempt+1}/{self.max_retries})")
+                    
+                    response = requests.post(
+                        f"{self.server_url}/has_human", 
+                        files=files,
+                        timeout=self.timeout
+                    )
+                # Process response...
+                
+                if response.status_code == 200:
+                    # Parse the response
+                    result_data = response.json()
+                    
+                    # Map API response to YoloResult
+                    return YoloResult(
+                        has_human=result_data.get("has_human", False),
+                        confidence=Decimal(str(result_data.get("score", 0.0))),
+                        human_count=len([r for r in result_data.get("results", []) 
+                                        if r.get("class_name", "").lower() == "person"])
+                    )
+                else:
+                    self.logger.warning(
+                        f"Remote YOLO API returned error: {response.status_code}, {response.text}"
+                    )
+            except Exception as e:
+                self.logger.warning(f"Error calling remote YOLO API (attempt {attempt+1}): {e}")
+            
+            # Wait before retrying
+            if attempt < self.max_retries - 1:
+                time.sleep(self.retry_delay)
+        
+        # If we get here, all remote attempts failed
+        self.logger.error(f"All {self.max_retries} attempts to use remote YOLO API failed. Falling back to local.")
+        self.server_available = False  # Mark server as unavailable to skip retries on future calls
+        return self._fallback_has_human(filepath)
+    
+    def _fallback_has_human(self, filepath: str) -> YoloResult:
+        """Use local provider as fallback when remote fails."""
+        # Initialize local provider if needed
+        if self._local_provider is None:
+            self._initialize_fallback()
+            
+        # If we still don't have a local provider, return a default result
+        if self._local_provider is None:
+            self.logger.error("No fallback provider available. Returning default result.")
+            return YoloResult(False, Decimal('0.0'), 0)
+            
+        # Use local provider
+        self.logger.info(f"Using local YOLO fallback for: {filepath}")
+        return self._local_provider.has_human(filepath)
 
 if __name__ == "__main__":
     pass
