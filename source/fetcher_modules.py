@@ -5,14 +5,17 @@ import re
 import time
 import collections
 import random
-import datetime
+from typing import Optional, Tuple
+from zoneinfo import ZoneInfo
+from enum import Enum
+from datetime import datetime
 from dataclasses import dataclass
+import instaloader
 from source.logging_modules import CustomLogger
 from source.database_modules import DatabaseConnection, DatabaseManager
 from source.hash_modules import HashCalculator
 from source.fingerprint_modules import VideoFingerprinter
 from source.yolo_modules import YoloProvider
-import instaloader
 from instaloader import (
         Instaloader,
         TwoFactorAuthRequiredException, 
@@ -22,141 +25,406 @@ from instaloader import (
         RateController, 
         QueryReturnedBadRequestException)
 
-# Base RateController config
+# Constants
+SECONDS_IN_MINUTE = 60
+SECONDS_IN_HOUR = 60 * SECONDS_IN_MINUTE
+SECONDS_IN_DAY = 24 * SECONDS_IN_HOUR
+SECONDS_IN_WEEK = 7 * SECONDS_IN_DAY
+SECONDS_IN_MONTH = 30 * SECONDS_IN_DAY
+
+# Configurable variables
+MIN_REQUESTS_PER_MINUTE = 1
+MAX_REQUESTS_PER_MINUTE = 30
+
+MIN_REQUESTS_PER_HOUR = 10
 MAX_REQUESTS_PER_HOUR = 100
-MIN_REQUEST_INTERVAL = 2.0
-MIN_REQUEST_JITTER = 1.0
-INITIAL_BACKOFF = 20
+
+MIN_REQUESTS_PER_DAY = 1
+MAX_REQUESTS_PER_DAY = 100
+
+MIN_REQUESTS_PER_WEEK = 1
+MAX_REQUESTS_PER_WEEK = 50
+
+MIN_REQUESTS_PER_MONTH = 1
+MAX_REQUESTS_PER_MONTH = 100
+
+POSTS_BEFORE_WAIT_MIN = 10
+POSTS_BEFORE_WAIT_MAX = 50
+
+PAUSE_BEFORE_BETWEEN_POSTS_MIN = 1
+PAUSE_BEFORE_BETWEEN_POSTS_MAX = 5
+
+DAILY_LIMIT_REQUEST_MIN = 100
+DAILY_LIMIT_REQUEST_MAX = 200
+
+INITIAL_BACKOFF_FACTOR = 20
 BACKOFF_FACTOR = 1.5
-DAILY_LIMIT = 0
 
-POSTS_BEFORE_WAIT_MIN = 5
-POSTS_BEFORE_WAIT_MAX = 30
+# Time-based rate control constants
+MORNING_START = 5  # 5 AM
+MORNING_END = 8  # 8 AM
+DAY_START = 9  # 9 AM
+DAY_END = 12  # 12 PM
+MIDDAY_START = 13  # 1 PM
+MIDDAY_END = 18  # 6 PM
+EVENING_START = 18  # 6 PM
+EVENING_END = 22  # 10 PM
+NIGHT_START = 22  # 10 PM
+NIGHT_END = 24  # 12 AM
+SLEEP_START = 0  # 12 AM
+SLEEP_END = 5  # 5 AM
 
-LONG_PAUSE_WAIT_MIN = 30
-LONG_PAUSE_WAIT_MAX = 3600
+# Request limits by time of day
+EARLY_MORNING_MIN_REQUESTS = 5
+EARLY_MORNING_MAX_REQUESTS = 10
+MORNING_MIN_REQUESTS = 10
+MORNING_MAX_REQUESTS = 50
+MIDDAY_MIN_REQUESTS = 10
+MIDDAY_MAX_REQUESTS = 50
+EVENING_MIN_REQUESTS = 30
+EVENING_MAX_REQUESTS = 100
+LATE_NIGHT_MIN_REQUESTS = 20
+LATE_NIGHT_MAX_REQUESTS = 80
+SLEEP_REQUESTS = 0
+
+LONG_PAUSE_WAIT_MIN = 30  # 30 seconds minimum for long pauses
+LONG_PAUSE_WAIT_MAX = 300  # 5 minutes maximum for long pauses
+
+class TimeBasedRateLimit(Enum):
+    """ Rate Limits for different time periods """
+    SLEEP = 0
+    EARLY_MORNING = 1
+    MORNING = 2
+    MID_DAY = 3
+    EVENING = 4
+    LATE_NIGHT = 5
+    DAILY = 6
+    WEEKLY = 7
+    MONTHLY = 8
+
 
 class RateController(instaloader.RateController):
-    def __init__(self, context):
-        super().__init__(context)
-        self.logger = CustomLogger(__name__).get_logger()
+    """Custom rate controller for Instaloader to manage request rates"""
 
-        # For normal request limiting
+    def __init__(self, context, timezone="Asia/Seoul", logger=None):
+        super().__init__(context)
+
+        # Get logger if provided or use print statements
+        if logger:
+            self.logger = logger
+        else:
+            from source.logging_modules import CustomLogger
+            self.logger = CustomLogger(__name__).get_logger()
+
+        # Configuration parameters
+        self.min_requests_per_hour = MIN_REQUESTS_PER_HOUR
+        self.max_requests_per_hour = MAX_REQUESTS_PER_HOUR
+        self.min_requests_per_min = MIN_REQUESTS_PER_MINUTE
+        self.max_requests_per_min = MAX_REQUESTS_PER_MINUTE
+        self.posts_before_wait_min = POSTS_BEFORE_WAIT_MIN
+        self.posts_before_wait_max = POSTS_BEFORE_WAIT_MAX
+        self.pause_before_between_posts_min = PAUSE_BEFORE_BETWEEN_POSTS_MIN
+        self.pause_before_between_posts_max = PAUSE_BEFORE_BETWEEN_POSTS_MAX
+        self.daily_limit_request_min = DAILY_LIMIT_REQUEST_MIN
+        self.daily_limit_request_max = DAILY_LIMIT_REQUEST_MAX
+        self.initial_backoff_factor = INITIAL_BACKOFF_FACTOR
+
+        # Set the timezone for time-based rate limiting
+        self.timezone = ZoneInfo(timezone)
+
+        # For rate tracking
+        self.minute_request_times = collections.deque(maxlen=MAX_REQUESTS_PER_MINUTE)
         self.hourly_request_times = collections.deque(maxlen=MAX_REQUESTS_PER_HOUR)
-        self.daily_request_times = collections.deque(maxlen=DAILY_LIMIT if DAILY_LIMIT > 0 else None)
+        self.daily_request_times = collections.deque(maxlen=MAX_REQUESTS_PER_DAY)
+        self.weekly_request_times = collections.deque(maxlen=MAX_REQUESTS_PER_WEEK)
+        self.monthly_request_times = collections.deque(maxlen=MAX_REQUESTS_PER_MONTH)
         self.last_request_time = 0.0
 
-        # Error counters
+        # Error handling counters
         self.consecutive_429_errors = 0
-        self.consecutive_softblock_errors = 0
+        self.consecutive_403_errors = 0
+        self.consecutive_500_errors = 0
 
         # Human-like pause logic
-        # Start with a random target (e.g., after 3-7 posts, take a longer break)
         self.posts_since_pause = 0
-        self.posts_until_next_pause = random.randint(POSTS_BEFORE_WAIT_MIN, POSTS_BEFORE_WAIT_MAX)  
+        self.posts_until_next_pause = random.randint(self.posts_before_wait_min, self.posts_before_wait_max)
+
+        # Set the daily request limit based on the specified range
+        self.daily_request_limit = random.randint(DAILY_LIMIT_REQUEST_MIN, DAILY_LIMIT_REQUEST_MAX)
+        self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] RateController initialized with daily limit: {self.daily_request_limit} requests")
 
     def wait_before_query(self, query_type: str):
         """
-        Called by Instaloader before each request.  
-        We do:
-          1) Hourly and daily limit checks
-          2) Minimum interval with jitter
-          3) Possibly a "human-like" longer pause after some posts
+        Called by Instaloader before each request.
+        Implements:
+        1. Time-based rate control
+        2. Mandatory minimum interval with jitter
+        3. Per-minute, per-hour, per-day limits
+        4. Human-like pauses between posts
         """
         now = time.time()
+        current_datetime = datetime.now(self.timezone)
 
-        # Reset error counters on a successful request
+        # Reset error counters on successful requests
         self.consecutive_429_errors = 0
-        self.consecutive_softblock_errors = 0
+        self.consecutive_403_errors = 0
+        self.consecutive_500_errors = 0
 
-        # (A) Hourly limit
-        if len(self.hourly_request_times) == self.hourly_request_times.maxlen:
-            oldest_hr = self.hourly_request_times[0]
-            elapsed_hr = now - oldest_hr
-            if elapsed_hr < 3600:
-                wait_time = 3600 - elapsed_hr
-                self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Hourly limit reached ({MAX_REQUESTS_PER_HOUR}/hr). Sleeping {wait_time:.0f}s.")
+        # 1. Time-based rate control
+        time_period, min_req, max_req = self._get_time_based_rate_control(current_datetime)
+
+        # If we're in sleep time, wait until the end of sleep period
+        if time_period == TimeBasedRateLimit.SLEEP:
+            sleep_hours_end = SLEEP_END
+            current_hour = current_datetime.hour
+
+            if current_hour < sleep_hours_end:
+                # Calculate seconds until SLEEP_END hour
+                wait_seconds = (sleep_hours_end - current_hour) * SECONDS_IN_HOUR
+                # Subtract already elapsed minutes and seconds
+                wait_seconds -= (current_datetime.minute * SECONDS_IN_MINUTE + current_datetime.second)
+
+                self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Sleep time period. Waiting until {sleep_hours_end}:00 AM - {wait_seconds // 60} minutes, {wait_seconds % 60} seconds")
+                self._sleep(wait_seconds)
+                return self.wait_before_query(query_type)  # Retry after sleep
+
+        # 2. Apply per-minute limit
+        if len(self.minute_request_times) >= max_req:
+            oldest_req = self.minute_request_times[0]
+            elapsed = now - oldest_req
+
+            if elapsed < SECONDS_IN_MINUTE:
+                wait_time = SECONDS_IN_MINUTE - elapsed
+                self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Per-minute limit reached. Waiting {wait_time:.2f}s")
                 self._sleep(wait_time)
                 now = time.time()
 
-        # (B) Daily limit logic (only if DAILY_LIMIT > 0)
-        if DAILY_LIMIT > 0:
-            while self.daily_request_times and (now - self.daily_request_times[0] > 86400):
+        # 3. Apply per-hour limit
+        if len(self.hourly_request_times) >= self.max_requests_per_hour:
+            oldest_hr_req = self.hourly_request_times[0]
+            elapsed_hr = now - oldest_hr_req
+
+            if elapsed_hr < SECONDS_IN_HOUR:
+                wait_time = SECONDS_IN_HOUR - elapsed_hr
+                self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Hourly limit reached ({self.max_requests_per_hour}/hr). Waiting {wait_time:.0f}s")
+                self._sleep(wait_time)
+                now = time.time()
+
+        # 4. Apply daily limit
+        if len(self.daily_request_times) >= self.daily_request_limit:
+            # Clean up old entries from more than 24 hours ago
+            while self.daily_request_times and (now - self.daily_request_times[0] > SECONDS_IN_DAY):
                 self.daily_request_times.popleft()
 
-            if len(self.daily_request_times) == self.daily_request_times.maxlen:
+            if len(self.daily_request_times) >= self.daily_request_limit:
                 oldest_daily = self.daily_request_times[0]
                 elapsed_daily = now - oldest_daily
-                wait_time = 86400 - elapsed_daily
-                self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black] Daily limit of {DAILY_LIMIT} in 24hr window reached. Sleeping {wait_time:.0f}s.")
-                self._sleep(wait_time)
-                now = time.time()
 
-        # (C) Minimum interval + random jitter
+                if elapsed_daily < SECONDS_IN_DAY:
+                    wait_time = SECONDS_IN_DAY - elapsed_daily
+                    self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Daily limit of {self.daily_request_limit} reached. Waiting {wait_time / SECONDS_IN_HOUR:.1f} hours")
+                    self._sleep(wait_time)
+                    now = time.time()
+
+        # 5. Minimum interval + random jitter
         elapsed = now - self.last_request_time
-        min_interval_with_jitter = MIN_REQUEST_INTERVAL + random.uniform(0, MIN_REQUEST_JITTER)
+        min_interval = 60.0 / max_req  # Minimum seconds between requests
+        jitter = random.uniform(0, min_interval * 0.5)  # Up to 50% random jitter
+
+        min_interval_with_jitter = min_interval + jitter
+
         if elapsed < min_interval_with_jitter:
             wait_time = min_interval_with_jitter - elapsed
-            self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black][bold bright_blue] Sleeping {wait_time:.2f}s (min interval).[/bold bright_blue]")
+            self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Applying minimum interval. Waiting {wait_time:.2f}s")
             self._sleep(wait_time)
             now = time.time()
 
-        # (D) Human-like random "long break"
-        # Increment the post count, and if we've hit the threshold, do a bigger wait
-        self.posts_since_pause += 1
-        if self.posts_since_pause >= self.posts_until_next_pause:
-            long_pause = random.uniform(LONG_PAUSE_WAIT_MIN, LONG_PAUSE_WAIT_MAX)  # e.g. 1-5 minutes
-            self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Human-like long pause: sleeping {long_pause:.2f}s after {self.posts_since_pause} posts.")
-            self._sleep(long_pause)
-            self.posts_since_pause = 0
-            self.posts_until_next_pause = random.randint(POSTS_BEFORE_WAIT_MIN, POSTS_BEFORE_WAIT_MAX)  # re-randomize
+        # 6. Human-like random "long break" between posts
+        if query_type in ["get_feed_posts", "get_profile", "get_post_page", "get_igtv_page"]:
+            self.posts_since_pause += 1
 
-        # (E) Record timestamp
-        self.hourly_request_times.append(time.time())
-        if DAILY_LIMIT > 0:
-            self.daily_request_times.append(time.time())
-        self.last_request_time = time.time()
+            if self.posts_since_pause >= self.posts_until_next_pause:
+                # Take a longer pause after a certain number of posts
+                long_pause = random.uniform(LONG_PAUSE_WAIT_MIN, LONG_PAUSE_WAIT_MAX)
+                self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Taking a human-like break after {self.posts_since_pause} posts. Pausing for {long_pause:.1f}s")
+                self._sleep(long_pause)
 
-        self.logger.debug(f"[bright_black][RateLimiter]🚦[/bright_black] Query '{query_type}' at {time.strftime('%X')}.")
+                # Reset the post counter and randomize the next pause
+                self.posts_since_pause = 0
+                self.posts_until_next_pause = random.randint(self.posts_before_wait_min, self.posts_before_wait_max)
+
+                now = time.time()
+
+        # 7. Record the request time in all tracking deques
+        current_time = time.time()
+        self.minute_request_times.append(current_time)
+        self.hourly_request_times.append(current_time)
+        self.daily_request_times.append(current_time)
+        self.weekly_request_times.append(current_time)
+        self.monthly_request_times.append(current_time)
+        self.last_request_time = current_time
+
+        # Log the query being made
+        self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Executing query '{query_type}' at {datetime.now(self.timezone).strftime('%H:%M:%S')}")
+
+    def _get_time_based_rate_control(self, current_time: datetime) -> Tuple[TimeBasedRateLimit, int, int]:
+        """
+        Determine rate limits based on time of day.
+        Returns a tuple of (time_period, min_requests, max_requests)
+
+        Time periods:
+        - Early Morning (5am-8am): 5-10 requests per minute
+        - Morning (9am-12pm): 10-50 requests per minute
+        - Mid-day (1pm-6pm): 10-50 requests per minute
+        - Evening (6pm-10pm): 30-100 requests per minute
+        - Late Night (10pm-12am): 20-80 requests per minute
+        - Sleep (12am-5am): 0 requests per minute (sleep mode)
+        """
+        hour = current_time.hour
+
+        if SLEEP_START <= hour < SLEEP_END:
+            # Sleep time (12am-5am): No requests
+            return TimeBasedRateLimit.SLEEP, 0, 0
+
+        elif MORNING_START <= hour < MORNING_END:
+            # Early morning (5am-8am): Very low rate
+            return TimeBasedRateLimit.EARLY_MORNING, EARLY_MORNING_MIN_REQUESTS, EARLY_MORNING_MAX_REQUESTS
+
+        elif DAY_START <= hour < DAY_END:
+            # Morning (9am-12pm): Moderate rate
+            return TimeBasedRateLimit.MORNING, MORNING_MIN_REQUESTS, MORNING_MAX_REQUESTS
+
+        elif MIDDAY_START <= hour < MIDDAY_END:
+            # Mid-day (1pm-6pm): Moderate rate
+            return TimeBasedRateLimit.MID_DAY, MIDDAY_MIN_REQUESTS, MIDDAY_MAX_REQUESTS
+
+        elif EVENING_START <= hour < EVENING_END:
+            # Evening (6pm-10pm): High rate
+            return TimeBasedRateLimit.EVENING, EVENING_MIN_REQUESTS, EVENING_MAX_REQUESTS
+
+        else:  # NIGHT_START <= hour < NIGHT_END
+            # Late night (10pm-12am): Moderate-high rate
+            return TimeBasedRateLimit.LATE_NIGHT, LATE_NIGHT_MIN_REQUESTS, LATE_NIGHT_MAX_REQUESTS
+
+    def handle_200(self, query_type: str):
+        """Handle successful request (HTTP 200) - reset error counters"""
+        self.consecutive_429_errors = 0
+        self.consecutive_403_errors = 0
+        self.consecutive_500_errors = 0
+        self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Request '{query_type}' succeeded with 200 OK")
+
+    def handle_400(self, query_type: str):
+        """Handle Bad Request (HTTP 400) - client-side error"""
+        self.logger.warning(f"Bad request (400) for '{query_type}'. This is usually a client-side error.")
+        # Implement a small delay
+        wait_time = random.uniform(1.0, 3.0)
+        self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black] Waiting {wait_time:.2f}s after 400 error")
+        self._sleep(wait_time)
+
+    def handle_401(self, query_type: str):
+        """Handle Unauthorized (HTTP 401) - auth issues"""
+        self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black] Unauthorized (401) for '{query_type}'. Authentication issue detected.")
+        # Suggest login or re-authentication
+        wait_time = random.uniform(5.0, 10.0)
+        self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black] Waiting {wait_time:.2f}s after 401 error")
+        self._sleep(wait_time)
+
+    def handle_403(self, query_type: str):
+        """Handle Forbidden (HTTP 403) - may indicate account actions needed"""
+        self.consecutive_403_errors += 1
+        backoff_secs = self.initial_backoff_factor * (BACKOFF_FACTOR ** (self.consecutive_403_errors - 1))
+
+        # Cap the maximum backoff time to 2 hours
+        backoff_secs = min(backoff_secs, 7200)
+
+        self.logger.error(f"[bright_black][RateLimiter]🚦[/bright_black] Forbidden (403) for '{query_type}'. This may indicate account actions required.")
+        self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black] Consecutive 403 errors: {self.consecutive_403_errors}. Backing off for {backoff_secs:.1f}s")
+        self._sleep(backoff_secs)
+
+    def handle_404(self, query_type: str):
+        """Handle Not Found (HTTP 404) - resource doesn't exist"""
+        self.logger.error(f"[bright_black][RateLimiter]🚦[/bright_black] Not found (404) for '{query_type}'. The requested resource doesn't exist.")
+        # Minimal waiting for 404s as they're expected sometimes
+        wait_time = random.uniform(1.0, 2.0)
+        self._sleep(wait_time)
+
+    def handle_429(self, query_type: str):
+        """Handle Too Many Requests (HTTP 429) - rate limiting"""
+        self.consecutive_429_errors += 1
+        backoff_secs = self.initial_backoff_factor * (BACKOFF_FACTOR ** (self.consecutive_429_errors - 1))
+
+        # Cap the maximum backoff time to 4 hours
+        backoff_secs = min(backoff_secs, 14400)
+
+        self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black] Rate limit (429) for '{query_type}'. This indicates we're sending too many requests.")
+        self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black] Consecutive 429 errors: {self.consecutive_429_errors}. Backing off for {backoff_secs:.1f}s")
+        self._sleep(backoff_secs)
+
+    def handle_500(self, query_type: str):
+        """Handle Server Error (HTTP 500) - Instagram server issue"""
+        self.consecutive_500_errors += 1
+
+        # For server errors, use a more gradual backoff
+        backoff_secs = 5.0 * (BACKOFF_FACTOR ** (self.consecutive_500_errors - 1))
+        backoff_secs = min(backoff_secs, 3600)  # Cap at 1 hour
+
+        self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black] Server error (500) for '{query_type}'. This is an Instagram server issue.")
+        self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black] Consecutive 500 errors: {self.consecutive_500_errors}. Backing off for {backoff_secs:.1f}s")
+        self._sleep(backoff_secs)
 
     def handle_soft_block(self, query_type: str, message: str):
         """
-        Example approach: exponential backoff for repeated 401 "please wait" blocks
+        Handle soft blocks from Instagram (usually in 400 responses with specific messages).
+        Implements exponential backoff for repeated blocks.
         """
-        self.consecutive_softblock_errors += 1
-        base_backoff = 1800  # e.g. 30 minutes
+        self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Soft block detected for '{query_type}': {message}")
+
+        # For soft blocks, implement a very conservative backoff
+        base_backoff = 1800  # 30 minutes
         factor = 1.5
-        backoff_secs = base_backoff * (factor ** (self.consecutive_softblock_errors - 1))
-        self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black][bold bright_red] Soft-block. Sleeping for {backoff_secs:.0f}s.[/bold bright_red]")
-        self._sleep(backoff_secs)
+        self.consecutive_403_errors += 1  # Use the 403 counter for soft blocks too
 
-    def handle_429(self, query_type: str):
-        """
-        Exponential backoff for repeated 429 errors
-        """
-        self.consecutive_429_errors += 1
-        backoff_secs = INITIAL_BACKOFF * (BACKOFF_FACTOR ** (self.consecutive_429_errors - 1))
-        self.logger.error(f"[bright_black][RateLimiter]🚦[/bright_black][bold bright_blue] 429. Backing off {backoff_secs:.1f}s.[/bold bright_blue]")
-        self._sleep(backoff_secs)
+        backoff_secs = base_backoff * (factor ** (self.consecutive_403_errors - 1))
+        # Cap at 8 hours max
+        backoff_secs = min(backoff_secs, 28800)
 
-    def get_config():
-        return {
-            MAX_REQUESTS_PER_HOUR,
-            DAILY_LIMIT
-        }
+        self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Soft block backoff: sleeping for {backoff_secs / 60:.1f} minutes")
+        self._sleep(backoff_secs)
 
     def sleep(self, secs: float):
         """Called by Instaloader in some situations."""
-        self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black][bold bright_red] Sleeping {secs:.2f}s by Instaloader's request.[/bold bright_red]")
+        self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black] Sleeping {secs:.2f}s by Instaloader's request")
         self._sleep(secs)
 
     def _sleep(self, secs: float):
-        """Unified place for all sleeps (with possible KeyboardInterrupt catching)."""
+        """Unified place for all sleeps with KeyboardInterrupt handling."""
         try:
+            # Ensure minimum sleep time and round to 2 decimals for logging clarity
+            secs = max(secs, 0.1)
+            secs = round(secs, 2)
+
+            if secs > 60:
+                mins = secs / 60
+                self.logger.warning(f"[bright_black][RateLimiter]🚦[/bright_black] Sleeping for {mins:.1f} minutes")
+
             time.sleep(secs)
         except KeyboardInterrupt:
-            self.logger.warning("[bright_black][RateLimiter]🚦[/bright_black] Sleep interrupted by user.")
+            self.logger.info(f"[bright_black][RateLimiter]🚦[/bright_black] Sleep interrupted by user. Exiting...")
             raise
+
+    def get_config(self):
+        """Return current configuration settings"""
+        return {
+            "min_requests_per_hour": self.min_requests_per_hour,
+            "max_requests_per_hour": self.max_requests_per_hour,
+            "min_requests_per_min": self.min_requests_per_min,
+            "max_requests_per_min": self.max_requests_per_min,
+            "posts_before_wait": (self.posts_before_wait_min, self.posts_before_wait_max),
+            "pause_between_posts": (self.pause_before_between_posts_min, self.pause_before_between_posts_max),
+            "daily_limit": self.daily_request_limit,
+            "timezone": str(self.timezone),
+            "backoff_factor": BACKOFF_FACTOR
+        }
 
 # ------------------------------
 # Data Classes

@@ -3,6 +3,7 @@ logs/
 *.log
 
 # Ignore compiled Python files
+.idea/
 .venv/
 venv/
 __pycache__/
