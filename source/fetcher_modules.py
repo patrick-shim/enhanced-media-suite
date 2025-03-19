@@ -1,4 +1,3 @@
-from ast import Tuple
 import os
 import traceback
 import re
@@ -101,7 +100,6 @@ class TimeBasedRateLimit(Enum):
     DAILY = 6
     WEEKLY = 7
     MONTHLY = 8
-
 
 class RateController(instaloader.RateController):
     """Custom rate controller for Instaloader to manage request rates"""
@@ -630,13 +628,27 @@ class InstagramFetcher:
                 if isinstance(L.context._rate_controller, RateController):
                     L.context._rate_controller.handle_soft_block("download_post", str(e))
             self.logger.error(f"[bright_black][Fetcher]📸[/bright_black] Connection error: {e}")
-        
+            # Don't re-raise, allow the process to continue
+            
         except QueryReturnedBadRequestException as e:
             if "checkpoint_required" in str(e).lower() or "challenge_required" in str(e).lower():
                 self.logger.error("[bright_black][Fetcher]📸[/bright_black] Instagram requires verification. Please log in through a browser.")
                 input("[bright_black][Fetcher]📸[/bright_black] Press Enter after completing verification in the browser...")
                 self.logger.info("[bright_black][Fetcher]📸[/bright_black] Retrying after checkpoint verification...")
-                # Optional: You could add recursive retry logic here
+                # Retry after verification
+                try:
+                    self._download_and_process_posts(
+                        L=L,
+                        profile_name=profile_name,
+                        save_to=save_to,
+                        download_directory=download_directory,
+                        table_name=table_name,
+                        db_connection=db_connection,
+                        db_manager=db_manager,
+                        limit=limit
+                    )
+                except Exception as retry_e:
+                    self.logger.error(f"[bright_black][Fetcher]📸[/bright_black] Error after verification: {retry_e}")
             else:
                 self.logger.error(f"[bright_black][Fetcher]📸[/bright_black] Bad request error: {e}")
         
@@ -788,21 +800,38 @@ class InstagramFetcher:
 
             for post in post_list:
                 # 2) Retry logic for each post
+                download_success = False
                 for attempt in range(max_retries):
                     try:
                         L.download_post(post, target=save_to)
                         current_media_count += 1
+                        download_success = True
                         break  # If successful, break out of retry loop
                     except ConnectionException as e:
+                        error_message = str(e).lower()
                         self.logger.warning(
                             f"[bright_black][Fetcher]📸[/bright_black] ConnectionException: {e} - Attempt {attempt+1}/{max_retries} failed."
                         )
-                        # If it's the last attempt, re-raise or log
+                        
+                        # If it's a "410 Gone" error (content deleted or no longer available)
+                        if "410 gone" in error_message:
+                            self.logger.warning(
+                                f"[bright_black][Fetcher]📸[/bright_black] Post {post.shortcode} appears to be deleted (410 Gone). Skipping this post."
+                            )
+                            break  # Exit the retry loop for this post
+                        
+                        # If it's the last attempt and not a 410 error, log and continue
                         if attempt == max_retries - 1:
                             self.logger.error(
                                 f"[bright_black][Fetcher]📸[/bright_black] Failed to download post {post.shortcode} after {max_retries} attempts."
                             )
-                            raise
+                            # Instead of raising, just continue to the next post
+                            # We don't raise here anymore
+
+                # Skip processing if download failed
+                if not download_success:
+                    self.logger.info(f"[bright_black][Fetcher]📸[/bright_black] Skipping processing for failed download: {post.shortcode}")
+                    continue
 
                 # 3) Process newly downloaded files
                 final_download_directory = os.path.join(download_directory)

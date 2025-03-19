@@ -3,10 +3,7 @@ import re
 import shutil
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, List
-
-from source.yolo_modules import YoloProvider
-from source.logging_modules import CustomLogger
+from typing import Callable, List, Set, Any
 
 class Merger:
     """
@@ -20,7 +17,7 @@ class Merger:
         image_destination: str,
         video_destination: str,
         thread_count: int = 4,
-        yolo_provider: YoloProvider = None,
+        yolo_provider: Any = None,
         human_only: bool = False
     ):
         """
@@ -29,6 +26,8 @@ class Merger:
         :param image_destination: Destination directory for image files
         :param video_destination: Destination directory for video files
         :param thread_count:     Number of threads for parallel merging
+        :param yolo_provider:    Provider for human detection in images
+        :param human_only:       Only copy images containing humans
         """
         self.logger = logger
         self.sources = sources
@@ -46,6 +45,8 @@ class Merger:
         """
         Main entry point to perform the merge operation.
         Walk each source directory and merge files into appropriate destinations.
+        
+        :param stop_flag_ref: Function that returns True if operation should stop
         """
         self.logger.info("[Merger] Starting merge run.")
         
@@ -67,6 +68,10 @@ class Merger:
                 self.logger.info(f"[Merger] Merging from source: {src_dir}")
                 # Walk the source directory
                 for root, dirs, files in os.walk(src_dir):
+                    if stop_flag_ref():
+                        self.logger.warning("[Merger] Stop flag set. Aborting further merging.")
+                        break
+
                     # Figure out the relative path from src_dir
                     rel_path = os.path.relpath(root, start=src_dir)
                     
@@ -97,10 +102,12 @@ class Merger:
                             self.logger.debug(f"[Merger] Skipping unknown file type: {source_file_path}")
                             continue
                         
+                        # Human detection for images if enabled
                         if self.human_only and file_ext in self.image_extensions and self.yolo_provider:
                             try:
                                 yolo_result = self.yolo_provider.has_human(source_file_path)
                                 if not yolo_result.has_human:
+                                    self.logger.debug(f"[Merger] Skipping image with no humans: {source_file_path}")
                                     continue
                                 was_human = True
                             except Exception as e:
@@ -108,10 +115,16 @@ class Merger:
                                 continue
                         else:
                             was_human = False
-                        # get filename from the path:
 
-                        self.logger.info(f"[Merger] {source_file_path} -> {destination_file_path}")
-                        executor.submit(self._handle_file, source_file_path, destination_file_path, destination_type, was_human, stop_flag_ref)
+                        # Submit the file handling to the thread pool
+                        executor.submit(
+                            self._handle_file, 
+                            source_file_path, 
+                            destination_file_path, 
+                            destination_type, 
+                            was_human, 
+                            stop_flag_ref
+                        )
 
     def _handle_file(self, source_path: str, dest_path: str, file_type: str, was_human: bool, stop_flag_ref: Callable[[], bool]):
         """
@@ -127,9 +140,9 @@ class Merger:
         if stop_flag_ref():
             return
 
-        self.logger.debug(f"[Merger] currently processing {source_path}")
+        self.logger.debug(f"[Merger] Currently processing {source_path}")
 
-        # Compute source file's blake3 hash
+        # Compute source file's hash
         try:
             src_blake3 = self._calculate_blake3(source_path)
             if not src_blake3:
@@ -142,12 +155,48 @@ class Merger:
         # Destination directory
         dest_dir = os.path.dirname(dest_path)
 
-        # Comprehensive content check across destination directory
+        # First check if the destination file already exists
+        if os.path.exists(dest_path):
+            try:
+                # Calculate hash of existing file
+                dest_blake3 = self._calculate_blake3(dest_path)
+                
+                # If it's the same file (same hash), no need to copy
+                if dest_blake3 == src_blake3:
+                    self.logger.debug(f"[Merger] File already exists with same content: {dest_path}")
+                    return
+                
+                # If different content but same name, determine priority
+                source_priority = self._get_file_priority(os.path.basename(source_path))
+                dest_priority = self._get_file_priority(os.path.basename(dest_path))
+                
+                if source_priority < dest_priority:
+                    # Source has higher priority, replace the destination file
+                    self.logger.info(
+                        f"[Merger] Replacing existing file with higher priority source: "
+                        f"{dest_path} <- {source_path}"
+                    )
+                    os.remove(dest_path)
+                    # Continue to copy the file below
+                else:
+                    # Destination has equal or higher priority, skip
+                    self.logger.debug(
+                        f"[Merger] Skipping file with lower or equal priority: {source_path}"
+                    )
+                    return
+            except Exception as e:
+                self.logger.error(f"[Merger] Error checking existing file {dest_path}: {e}")
+                return
+                
+        # Check for files with same content but different names in the destination directory
         for existing_file in os.listdir(dest_dir):
+            if stop_flag_ref():
+                return
+                
             full_existing_path = os.path.join(dest_dir, existing_file)
             
             # Skip if it's a directory or not a file
-            if not os.path.isfile(full_existing_path):
+            if not os.path.isfile(full_existing_path) or full_existing_path == dest_path:
                 continue
             
             try:
@@ -168,16 +217,17 @@ class Merger:
                                 f"{full_existing_path} <- {source_path}"
                             )
                             os.remove(full_existing_path)
+                            # We'll copy to the original destination path
+                            # This allows for a rename if filenames are different
                         except Exception as e:
                             self.logger.error(f"[Merger] Error replacing file: {e}")
                             return
                     else:
                         # Existing file has equal or higher priority
                         self.logger.debug(
-                            f"[Merger] Skipping file with lower priority: {source_path}"
+                            f"[Merger] Skipping file with lower or equal priority: {source_path}"
                         )
                         return
-
             except Exception as e:
                 self.logger.error(f"[Merger] Error processing existing file {full_existing_path}: {e}")
                 continue
@@ -194,26 +244,12 @@ class Merger:
         except Exception as e:
             self.logger.error(f"[Merger] Error copying {file_type} file {source_path} -> {dest_path}: {e}")
 
-    def _find_same_content_file(self, directory: str, file_blake3: str) -> str:
-        """
-        Look in `directory` for a file with matching blake3. 
-        Return that file's path if found, else empty string.
-        """
-        try:
-            for f in os.listdir(directory):
-                candidate = os.path.join(directory, f)
-                if os.path.isfile(candidate):
-                    c_blake3 = self._calculate_blake3(candidate)
-                    if c_blake3 == file_blake3:
-                        return candidate
-        except Exception as e:
-            self.logger.error(f"[Merger] Error scanning directory {directory}: {e}")
-        return ""
-
     def _calculate_blake3(self, file_path: str) -> str:
         """
-        Calculate the BLAKE3-like digest for the file. 
-        (We can emulate with blake2b from hashlib if standard BLAKE3 not installed.)
+        Calculate the BLAKE3-like digest for the file using blake2b from hashlib.
+        
+        :param file_path: Path to the file
+        :return: Hex digest string or empty string on error
         """
         hasher = hashlib.blake2b()
         try:
@@ -224,7 +260,7 @@ class Merger:
                         break
                     hasher.update(chunk)
         except Exception as e:
-            self.logger.error(f"[Merger] Error reading file for BLAKE3: {file_path} => {e}")
+            self.logger.error(f"[Merger] Error reading file for hash calculation: {file_path} => {e}")
             return ""
         return hasher.hexdigest()
 
@@ -232,6 +268,9 @@ class Merger:
         """
         Determine the priority of a file based on filename pattern.
         Lower number => higher priority.
+        
+        :param filename: The filename to check
+        :return: Priority value (1-5, where 1 is highest)
         """
         # Highest priority: Instaloader exact pattern with timestamp and shortcode
         # Exact format: YYYYMMDD_HHMMSS_shortcode.ext
